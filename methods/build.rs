@@ -1,11 +1,13 @@
+// methods/build.rs
+
 // Copyright 2023 RISC Zero, Inc.
-//
+// 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-//
+// 
 //     http://www.apache.org/licenses/LICENSE-2.0
-//
+// 
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,18 +21,22 @@ use risc0_build_ethereum::generate_solidity_files;
 
 // Paths where the generated Solidity files will be written.
 const SOLIDITY_IMAGE_ID_PATH: &str = "../contracts/ImageID.sol";
-const SOLIDITY_ELF_PATH: &str = "../tests/Elf.sol";
+const SOLIDITY_ELF_PATH: &str     = "../tests/Elf.sol";
 
 fn main() {
+    // 1) Ensure submodules are initialized
     git_submodule_init();
     check_submodule_state();
 
-    // Builds can be made deterministic, and thereby reproducible, by using Docker to build the
-    // guest. Check the RISC0_USE_DOCKER variable and use Docker to build the guest if set.
+    // 2) Tell Cargo to rerun build.rs if RISC0_USE_DOCKER or build.rs itself changes
+    println!("cargo:rerun-if-changed=.gitmodules");
     println!("cargo:rerun-if-env-changed=RISC0_USE_DOCKER");
     println!("cargo:rerun-if-changed=build.rs");
-    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let mut builder = GuestOptionsBuilder::default();
+
+    // 3) If RISC0_USE_DOCKER is set, compile guest inside Docker
     if env::var("RISC0_USE_DOCKER").is_ok() {
         let docker_options = DockerOptionsBuilder::default()
             .root_dir(manifest_dir.join("../"))
@@ -40,10 +46,11 @@ fn main() {
     }
     let guest_options = builder.build().unwrap();
 
-    // Generate Rust source files for the methods crate.
-    let guests = embed_methods_with_options(HashMap::from([("guests", guest_options)]));
+    // 4) Explicitly embed the guest located at "methods/guest"
+    //    (this must match exactly the folder path under your workspace root)
+    let guests = embed_methods_with_options(HashMap::from([("methods/guest", guest_options)]));
 
-    // Generate Solidity source files for use with Forge.
+    // 5) Generate Solidity files for on‐chain verification
     let solidity_opts = risc0_build_ethereum::Options::default()
         .with_image_id_sol_path(SOLIDITY_IMAGE_ID_PATH)
         .with_elf_sol_path(SOLIDITY_ELF_PATH);
@@ -51,18 +58,12 @@ fn main() {
     generate_solidity_files(guests.as_slice(), &solidity_opts).unwrap();
 }
 
-/// Initializes git submodules by adding their configurations to .git/config.
-/// This is a one-time setup step that only needs to run on first clone of the repository.
-/// Does not fetch or update submodule contents.
-///
-/// # Warnings
-/// Prints a warning to stderr if the initialization fails, but does not interrupt the build process.
 fn git_submodule_init() {
     println!("cargo:rerun-if-changed=.gitmodules");
     let output = Command::new("git")
         .args(["submodule", "init"])
         .output()
-        .expect("failed to run git submodule init in methods/build.rs");
+        .expect("failed to run `git submodule init` in methods/build.rs");
 
     if !output.status.success() {
         eprintln!(
@@ -72,23 +73,12 @@ fn git_submodule_init() {
     }
 }
 
-/// Checks and reports the status of all git submodules in the project.
-/// Runs on every build to inform developers about the state of their submodules.
-///
-/// # Status Indicators
-/// - `-`: submodule is not initialized
-/// - `+`: submodule has local changes
-/// - ` `: submodule is clean (no warning displayed)
-///
-/// # Warnings
-/// Prints warnings for any non-clean states, but does not modify submodules
-/// or interrupt the build process.
 fn check_submodule_state() {
     println!("cargo:rerun-if-changed=.gitmodules");
     let status = Command::new("git")
         .args(["submodule", "status"])
         .output()
-        .expect("failed to run git submodule status");
+        .expect("failed to run `git submodule status`");
 
     if !status.status.success() {
         println!(
@@ -116,7 +106,10 @@ fn check_submodule_state() {
                     has_uninitialized = true;
                 }
                 '+' => {
-                    println!("cargo:warning=git submodule has local changes, this may cause unexpected behaviour: {}", path);
+                    println!(
+                        "cargo:warning=git submodule has local changes, this may cause unexpected behaviour: {}",
+                        path
+                    );
                     has_local_changes = true;
                 }
                 _ => (),
@@ -129,7 +122,6 @@ fn check_submodule_state() {
             "cargo:warning=to initialize missing submodules, run: git submodule update --init"
         );
     }
-
     if has_local_changes {
         println!("cargo:warning=to reset submodules to their expected versions, run: git submodule update --recursive");
     }
