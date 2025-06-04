@@ -1,114 +1,112 @@
-// Copyright 2024 RISC Zero, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// This application demonstrates how to send an off-chain proof request
-// to the Bonsai proving service and publish the received proofs directly
-// to your deployed app contract.
-
-use alloy::{
-    network::EthereumWallet, providers::ProviderBuilder, signers::local::PrivateKeySigner,
-    sol_types::SolValue,
-};
-use alloy_primitives::{Address, U256};
+use std::{fs, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
-use methods::IS_EVEN_ELF;
+use url::Url;
+use serde::{Deserialize, Serialize};
+use env_logger;
+
+use alloy::{
+    sol,
+    network::EthereumWallet,
+    providers::ProviderBuilder,
+    signers::local::PrivateKeySigner,
+};
+use alloy_primitives::{Address, U256};
+use methods::{PROOF_VERIFIER_GUEST_ELF, PROOF_VERIFIER_GUEST_ID};
 use risc0_ethereum_contracts::encode_seal;
 use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, VerifierContext};
-use url::Url;
 
-// `IEvenNumber` interface automatically generated via the alloy `sol!` macro.
-alloy::sol!(
+/// Generate a Rust binding to your `IVerifier` interface
+sol!(
     #[sol(rpc, all_derives)]
-    "../contracts/IEvenNumber.sol"
+    "../contracts/IVerifier.sol"
 );
 
-/// Arguments of the publisher CLI.
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    /// Ethereum chain ID
-    #[clap(long)]
-    chain_id: u64,
-
-    /// Ethereum Node endpoint.
-    #[clap(long, env)]
-    eth_wallet_private_key: PrivateKeySigner,
-
-    /// Ethereum Node endpoint.
-    #[clap(long)]
-    rpc_url: Url,
-
-    /// Application's contract address on Ethereum
-    #[clap(long)]
-    contract: Address,
-
-    /// The input to provide to the guest binary
-    #[clap(short, long)]
-    input: U256,
+/// Must match your guest’s `#[derive(Serialize, Deserialize)] struct VerificationOutput`.
+#[derive(Debug, Serialize, Deserialize)]
+struct VerificationOutput {
+    is_valid:    bool,
+    server_name: String,
+    score:       Option<u64>,
+    error:       Option<String>,
 }
 
-fn main() -> Result<()> {
+/// CLI args for the publisher
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// Ethereum chain ID (e.g. 1 for Mainnet, 5 for Goerli)
+    #[arg(long)]
+    chain_id: u64,
+
+    /// Hex private key for your wallet
+    #[arg(long, env = "ETH_WALLET_PRIVATE_KEY")]
+    eth_wallet_private_key: PrivateKeySigner,
+
+    /// RPC URL to an Ethereum node
+    #[arg(long)]
+    rpc_url: Url,
+
+    /// Address of your deployed verifier contract
+    #[arg(long)]
+    contract: Address,
+
+    /// Path to the TLSNotary proof JSON
+    #[arg(long, default_value = "data/proof.json")]
+    proof_path: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
-    // Parse CLI Arguments: The application starts by parsing command-line arguments provided by the user.
     let args = Args::parse();
 
-    // Create an alloy provider for that private key and URL.
-    let wallet = EthereumWallet::from(args.eth_wallet_private_key);
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(args.rpc_url);
+    // 1. Load the proof JSON
+    let proof_json = fs::read_to_string(&args.proof_path)
+        .with_context(|| format!("Failed reading proof file {}", args.proof_path.display()))?;
 
-    // ABI encode input: Before sending the proof request to the Bonsai proving service,
-    // the input number is ABI-encoded to match the format expected by the guest code running in the zkVM.
-    let input = args.input.abi_encode();
+    // 2. Run the proof through the guest
+    let mut builder = ExecutorEnv::builder();
+    builder.write(&proof_json)?;
+    let env = builder.build()?;
 
-    let env = ExecutorEnv::builder().write_slice(&input).build()?;
-
-    let receipt = default_prover()
+    let info = default_prover()
         .prove_with_ctx(
             env,
             &VerifierContext::default(),
-            IS_EVEN_ELF,
-            &ProverOpts::groth16(),
-        )?
-        .receipt;
+            PROOF_VERIFIER_GUEST_ELF,
+            &ProverOpts::default(),
+        )?;
+    let receipt = info.receipt;
 
-    // Encode the seal with the selector.
+    // 3. Verify ImageID
+    receipt.verify(PROOF_VERIFIER_GUEST_ID)?;
+
+    // 4. Decode the journal
+    let output: VerificationOutput = receipt.journal.decode()?;
+    println!("Guest output: {:#?}", output);
+
+    // 5. ABI-encode the SNARK proof and journal
     let seal = encode_seal(&receipt)?;
+    let server_name = output.server_name.into();
+    let score = U256::from(output.score.unwrap_or_default());
 
-    // Extract the journal from the receipt.
-    let journal = receipt.journal.bytes.clone();
+    // 6. Build an Alloy provider + wallet
+    let wallet = EthereumWallet::from(args.eth_wallet_private_key);
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .on_http(args.rpc_url.clone());
 
-    // Decode Journal: Upon receiving the proof, the application decodes the journal to extract
-    // the verified number. This ensures that the number being submitted to the blockchain matches
-    // the number that was verified off-chain.
-    let x = U256::abi_decode(&journal).context("decoding journal data")?;
+    // 7. Instantiate your contract binding
+    let contract = IVerifier::new(args.contract, provider);
 
-    // Construct function call: Using the IEvenNumber interface, the application constructs
-    // the ABI-encoded function call for the set function of the EvenNumber contract.
-    // This call includes the verified number, the post-state digest, and the seal (proof).
-    let contract = IEvenNumber::new(args.contract, provider);
-    let call_builder = contract.set(x, seal.into());
-
-    // Initialize the async runtime environment to handle the transaction sending.
-    let runtime = tokio::runtime::Runtime::new()?;
-
-    // Send transaction: Finally, send the transaction to the Ethereum blockchain,
-    // effectively calling the set function of the EvenNumber contract with the verified number and proof.
-    let pending_tx = runtime.block_on(call_builder.send())?;
-    runtime.block_on(pending_tx.get_receipt())?;
+    // 8. Call the on-chain method
+    let pending = contract
+        .verifyTLSNProof(output.is_valid, server_name, score, seal.into())
+        .send()
+        .await?;
+    let tx_rcpt = pending.get_receipt().await?;
+    println!("✅ tx succeeded in block {}", tx_rcpt.block_number.unwrap());
 
     Ok(())
 }

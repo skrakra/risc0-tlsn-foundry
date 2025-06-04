@@ -1,18 +1,33 @@
 [package]
 name = "apps"
-version = { workspace = true }
-edition = { workspace = true }
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-alloy = { workspace = true }
-alloy-primitives = { workspace = true }
-alloy-sol-types = { workspace = true }
-anyhow = { workspace = true }
-clap = { version = "4.0", features = ["derive", "env"] }
-env_logger = { version = "0.10" }
-log = { workspace = true }
-methods = { workspace = true }
-risc0-ethereum-contracts = { workspace = true }
-risc0-zkvm = { workspace = true, default-features = true }
-tokio = { version = "1.35", features = ["full"] }
-url = { workspace = true }
+anyhow                   = "1.0"
+clap                     = { version = "4.2", features = ["derive"] }
+url                      = "2.3"
+serde                    = { version = "1.0", features = ["derive"] }
+serde_json               = "1.0"
+methods                  = { path = "../methods" }
+
+# RISC-Zero SDK
+risc0-zkvm               = "2.0.2"
+risc0-ethereum-contracts = "2.0.2"
+
+# Alloy — enable exactly these features:
+alloy = { version = "0.7", features = [
+    "network",       # EthereumWallet
+    "providers",     # ProviderBuilder
+    "signers",       # the `signers` module
+    "signer-local",  # the `signers::local` sub-module
+    "sol-types",     # the `sol!` macro
+    "contract",      # codegen for IVerifier.sol
+] }
+alloy-primitives         = "0.7"
+
+# Tokio — pull in both macros and the multi-threaded runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Logging
+env_logger               = "0.10"

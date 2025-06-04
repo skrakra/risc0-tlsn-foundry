@@ -1,35 +1,46 @@
 # .gitpod.yml
+
 image: gitpod/workspace-full
 
 tasks:
   - name: Setup & Build
     init: |
-      # 1) Start Docker
-      sudo docker-up
-
-      # 2) Install system dependencies
+      # 1) Update package lists and install native RISC-V build dependencies
       sudo apt-get update
-      sudo apt-get install -y pkg-config libssl-dev build-essential
+      sudo apt-get install -y clang lld build-essential pkg-config libssl-dev
 
-      # 3) (Re)install Rust toolchain if needed
+      # 2) Ensure we’re on the stable Rust toolchain
       rustup default stable
 
-      # 4) Install Foundry
+      # 3) Add the riscv32im‐risc0‐zkvm‐elf Rust target (so embed_methods can compile the guest)
+      rustup target add riscv32im-risc0-zkvm-elf
+
+      # 4) Install Foundry (forge + cast)
       curl -L https://foundry.paradigm.xyz | bash
       source ~/.foundry/bin
 
-      # 5) Install RISC Zero toolchain
+      # 5) Install the RISC Zero toolchain (rzup) for host‐side utilities
       curl -L https://risczero.com/install | bash
       rzup install
 
-      # 6) Init submodules & build everything
+      # 6) Initialize all submodules (including methods/guest)
+      git submodule sync
       git submodule update --init --recursive
-      cargo build               # build zkVM program & publisher
-      forge build               # compile Solidity contracts
+
+      # 7) Build everything:
+      #    • `cargo build` compiles:
+      #       – methods/guest → RISC-V ELF via embed_methods
+      #       – methods (host crate) → embeds guest
+      #       – host/app binaries (e.g. apps/publisher.rs)
+      cargo build
+
+      # 8) Compile the generated Solidity contracts (ImageID.sol and Elf.sol)
+      forge build
 
   - name: Run Tests with Local Prover
     command: |
-      # Ensure full prover (no Bonsai)
+      # 1) Disable Bonsai (use full local prover)
       export RISC0_DEV_MODE=false
-      # Run Solidity + zkVM integration tests
+
+      # 2) Run Forge tests (Solidity + zkVM integration)
       forge test -vvv
